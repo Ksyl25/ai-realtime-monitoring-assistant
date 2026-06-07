@@ -23,11 +23,14 @@ En V2, j'ai renforcé la partie portfolio avec une démo en une commande, un das
 
 - Data engineering et simulation de données.
 - Traitement continu avec Pathway.
+- Feature engineering sur signaux temporels.
 - Machine learning non supervisé avec scikit-learn.
+- Evaluation sur labels simulés.
 - Industrialisation Python avec modules, CLI et tests.
 - API REST avec FastAPI.
 - Dashboard analytique avec Streamlit et Plotly.
 - Persistance SQLite.
+- Agent IA rule-based compatible extension LLM/LangGraph.
 - Documentation technique et storytelling CV.
 - Dockerisation d'une application Python.
 

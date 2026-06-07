@@ -13,6 +13,10 @@ def test_api_core_endpoints():
     metrics = client.get("/metrics")
     assert metrics.status_code == 200
     assert "total_events" in metrics.json()
+    assert client.get("/dashboard/summary").status_code == 200
+    assert client.get("/machines").status_code == 200
+    assert client.get("/machines/MACHINE_01/status").status_code == 200
+    assert client.get("/machines/MACHINE_01/history").status_code == 200
 
 
 def test_agent_query_endpoint():
@@ -23,4 +27,3 @@ def test_agent_query_endpoint():
     payload = response.json()
     assert "answer" in payload
     assert "sources" in payload
-

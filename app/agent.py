@@ -1,36 +1,67 @@
-"""Rule-based AI assistant with an optional LLM extension point."""
+"""V2 rule-based AI assistant with structured tools and optional LLM rewrite."""
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 from app.config import BUSINESS_THRESHOLDS, MACHINES
-from app.database import get_latest_anomalies, get_latest_events, get_metrics
+from app.database import (
+    get_latest_anomalies as db_get_latest_anomalies,
+    get_latest_events,
+    get_machine_history as db_get_machine_history,
+    get_machine_status as db_get_machine_status,
+    get_metrics,
+)
 from app.report_generator import generate_monitoring_report
 
 
 load_dotenv()
+
+CONVERSATION_MEMORY: deque[dict[str, str]] = deque(maxlen=6)
 
 
 @dataclass
 class AgentResponse:
     answer: str
     sources: list[str]
+    risk_level: str = "unknown"
+    recommendation: str = ""
+    data_used: dict[str, Any] = field(default_factory=dict)
+
+
+def get_latest_anomalies(limit: int = 100) -> pd.DataFrame:
+    """Tool: read recent anomalies from SQLite."""
+    return db_get_latest_anomalies(limit=limit)
+
+
+def get_machine_status(machine_id: str) -> dict[str, object]:
+    """Tool: get the latest operational status for one machine."""
+    return db_get_machine_status(machine_id.upper())
 
 
 def get_machine_history(machine_id: str, limit: int = 200) -> pd.DataFrame:
-    events = get_latest_events(limit=1000)
-    if events.empty:
-        return events
-    return events[events["machine_id"] == machine_id].head(limit)
+    """Tool: get recent sensor events for one machine."""
+    return db_get_machine_history(machine_id.upper(), limit=limit)
 
 
 def get_global_metrics() -> dict[str, object]:
+    """Tool: get global monitoring metrics."""
     return get_metrics()
+
+
+def generate_report() -> str:
+    """Tool: generate a Markdown report from recent anomalies."""
+    anomalies = get_latest_anomalies(limit=500)
+    if not anomalies.empty:
+        anomalies["is_anomaly"] = True
+    return generate_monitoring_report(anomalies)
 
 
 def _extract_machine_id(question: str) -> str | None:
@@ -41,51 +72,116 @@ def _extract_machine_id(question: str) -> str | None:
     return None
 
 
+def _risk_from_severity(severity: str | None) -> str:
+    mapping = {
+        "critical": "critical",
+        "high": "high",
+        "medium": "medium",
+        "low": "low",
+        "normal": "normal",
+    }
+    return mapping.get(str(severity).lower(), "unknown")
+
+
 def _describe_signal_drivers(row: pd.Series) -> list[str]:
     drivers: list[str] = []
-    if row["temperature"] >= BUSINESS_THRESHOLDS["temperature_warning"]:
+    reason = str(row.get("anomaly_reason", ""))
+    if "OVERHEAT" in reason or row["temperature"] >= BUSINESS_THRESHOLDS["temperature_warning"]:
         drivers.append(f"temperature elevated at {row['temperature']:.1f} C")
-    if row["pressure"] >= BUSINESS_THRESHOLDS["pressure_warning"]:
+    if "HIGH_PRESSURE" in reason or row["pressure"] >= BUSINESS_THRESHOLDS["pressure_warning"]:
         drivers.append(f"pressure elevated at {row['pressure']:.2f} bar")
-    if row["vibration"] >= BUSINESS_THRESHOLDS["vibration_warning"]:
+    if "HIGH_VIBRATION" in reason or row["vibration"] >= BUSINESS_THRESHOLDS["vibration_warning"]:
         drivers.append(f"vibration high at {row['vibration']:.3f}")
-    if row["power_consumption"] >= BUSINESS_THRESHOLDS["power_warning"]:
+    if "POWER_SURGE" in reason or row["power_consumption"] >= BUSINESS_THRESHOLDS["power_warning"]:
         drivers.append(f"power consumption high at {row['power_consumption']:.1f} W")
-    if row["motor_speed"] <= BUSINESS_THRESHOLDS["motor_speed_low_warning"]:
+    if "MOTOR_SPEED_DROP" in reason or row["motor_speed"] <= BUSINESS_THRESHOLDS["motor_speed_low_warning"]:
         drivers.append(f"motor speed low at {row['motor_speed']:.0f} rpm")
-    return drivers or ["the ML score is unusual compared with normal operating patterns"]
+    return drivers or ["the multivariate ML score is unusual compared with normal patterns"]
 
 
-def _recommendation(drivers: list[str]) -> str:
+def _recommendation(drivers: list[str], severity: str) -> str:
     joined = " ".join(drivers).lower()
+    prefix = "Immediate action: " if severity in {"critical", "high"} else "Recommended action: "
     if "temperature" in joined and "vibration" in joined:
-        return "Prioritize mechanical inspection and cooling checks; the combined pattern can indicate friction or load stress."
+        return prefix + "inspect cooling, lubrication, bearings, alignment, and load conditions."
     if "temperature" in joined:
-        return "Check cooling, ventilation, lubrication, and recent high-load operation."
+        return prefix + "check cooling, ventilation, lubrication, and recent high-load operation."
     if "vibration" in joined:
-        return "Inspect bearings, alignment, mounting, and imbalance before sustained operation."
+        return prefix + "inspect bearings, alignment, mounting, and imbalance."
     if "pressure" in joined:
-        return "Review pressure regulation, filters, valves, and process constraints."
+        return prefix + "review pressure regulation, filters, valves, and process constraints."
     if "power" in joined:
-        return "Compare load demand with motor behavior and inspect for inefficient operation."
+        return prefix + "compare load demand with motor behavior and inspect for inefficient operation."
     if "motor speed" in joined:
-        return "Inspect drive train, motor controller, and possible torque overload."
-    return "Review the recent machine history and validate sensor quality."
+        return prefix + "inspect drive train, motor controller, and possible torque overload."
+    return prefix + "review recent history and validate sensor quality."
 
 
-def _maybe_llm_rewrite(answer: str, question: str) -> str:
-    """Extension point for OpenAI/LangGraph without making the V1 fragile.
+def _maybe_llm_rewrite(response: AgentResponse, question: str) -> AgentResponse:
+    """Optional OpenAI-compatible rewrite, with deterministic fallback."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return response
+    try:
+        payload = {
+            "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Rewrite the monitoring assistant answer clearly and concisely. Do not invent facts.",
+                },
+                {
+                    "role": "user",
+                    "content": f"Question: {question}\nAnswer: {response.answer}",
+                },
+            ],
+            "temperature": 0.2,
+        }
+        result = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=15,
+        )
+        if result.ok:
+            response.answer = result.json()["choices"][0]["message"]["content"]
+    except Exception:
+        response.answer += "\n\nLLM rewrite unavailable; deterministic fallback was used."
+    return response
 
-    The prototype remains fully functional without an API key. In a future
-    version, this function can call a LangGraph workflow or an OpenAI model to
-    rewrite and enrich the deterministic answer.
-    """
-    if not os.getenv("OPENAI_API_KEY"):
-        return answer
-    return (
-        f"{answer}\n\n"
-        "Note: OPENAI_API_KEY is configured, but this V1 keeps the response deterministic. "
-        "The agent module is structured so this step can be replaced by a LangGraph/LLM node."
+
+def _machine_answer(question: str, machine_id: str, anomalies: pd.DataFrame) -> AgentResponse:
+    target = anomalies[anomalies["machine_id"] == machine_id] if not anomalies.empty else anomalies
+    status = get_machine_status(machine_id)
+    if target.empty:
+        recommendation = str(status.get("recommendation", "Continue monitoring."))
+        return AgentResponse(
+            answer=f"{machine_id} has no stored recent anomaly. Current status is {status['status']}.",
+            sources=["sqlite:anomalies", "sqlite:sensor_events"],
+            risk_level=str(status["status"]),
+            recommendation=recommendation,
+            data_used={"machine_status": status},
+        )
+    latest = target.iloc[0]
+    drivers = _describe_signal_drivers(latest)
+    risk = _risk_from_severity(str(latest.get("anomaly_severity")))
+    recommendation = _recommendation(drivers, risk)
+    answer = (
+        f"{machine_id} is in alert because {', '.join(drivers)}. "
+        f"Severity is {latest['anomaly_severity']} and anomaly score is {latest['anomaly_score']:.5f}."
+    )
+    if "surchauffe" in question.lower() or "overheat" in question.lower():
+        answer += " The current evidence indicates overheating risk." if "temperature" in " ".join(drivers).lower() else " The latest anomaly is not primarily a temperature issue."
+    return AgentResponse(
+        answer=answer,
+        sources=["sqlite:anomalies", "sqlite:sensor_events"],
+        risk_level=risk,
+        recommendation=recommendation,
+        data_used={
+            "machine_id": machine_id,
+            "latest_anomaly": latest.to_dict(),
+            "machine_status": status,
+        },
     )
 
 
@@ -94,64 +190,70 @@ def answer_question(question: str) -> dict[str, object]:
     normalized = question.lower()
     machine_id = _extract_machine_id(question)
     anomalies = get_latest_anomalies(limit=200)
-    metrics = get_metrics()
-    sources = ["sqlite:anomalies", "sqlite:sensor_events"]
+    metrics = get_global_metrics()
 
     if anomalies.empty:
-        answer = (
-            "No recent anomaly is stored yet. Start the simulator, run the processing pipeline, "
-            "then run anomaly prediction to populate the monitoring database."
+        response = AgentResponse(
+            answer=(
+                "No recent anomaly is stored yet. Run python -m app.bootstrap_demo "
+                "to prepare a complete monitoring demo."
+            ),
+            sources=["sqlite:anomalies", "sqlite:sensor_events"],
+            risk_level="unknown",
+            recommendation="Bootstrap the demo data before analysis.",
+            data_used={"metrics": metrics},
         )
-        return AgentResponse(answer=answer, sources=sources).__dict__
+        return response.__dict__
 
-    target = anomalies
     if machine_id:
-        target = anomalies[anomalies["machine_id"] == machine_id]
-        if target.empty:
-            answer = f"{machine_id} has no stored recent anomaly. Current global metrics: {metrics}."
-            return AgentResponse(answer=answer, sources=sources).__dict__
-
-    if "plus risqu" in normalized or "most risky" in normalized or "la plus risqu" in normalized:
+        response = _machine_answer(question, machine_id, anomalies)
+    elif "plus risqu" in normalized or "most risky" in normalized or "risquee" in normalized:
         counts = anomalies["machine_id"].value_counts()
         riskiest = counts.index[0]
-        answer = (
-            f"The riskiest machine is {riskiest}, with {counts.iloc[0]} recent anomalies. "
-            f"Critical alerts stored globally: {metrics['critical_alerts']}."
+        status = get_machine_status(riskiest)
+        response = AgentResponse(
+            answer=(
+                f"The riskiest machine is {riskiest}, with {counts.iloc[0]} recent anomalies. "
+                f"Current machine status is {status['status']}."
+            ),
+            sources=["sqlite:anomalies", "sqlite:sensor_events"],
+            risk_level=str(status["status"]),
+            recommendation=str(status["recommendation"]),
+            data_used={"metrics": metrics, "machine_status": status},
         )
-        return AgentResponse(answer=_maybe_llm_rewrite(answer, question), sources=sources).__dict__
-
-    if "rapport" in normalized or "résume" in normalized or "resume" in normalized:
-        report_df = anomalies.copy()
-        report_df["is_anomaly"] = True
-        answer = generate_monitoring_report(report_df)
-        sources.append("report_generator")
-        return AgentResponse(answer=_maybe_llm_rewrite(answer, question), sources=sources).__dict__
-
-    latest = target.iloc[0]
-    drivers = _describe_signal_drivers(latest)
-    recommendation = _recommendation(drivers)
-    machine_label = machine_id or latest["machine_id"]
-    answer = (
-        f"{machine_label} is in alert because {', '.join(drivers)}. "
-        f"The latest anomaly severity is {latest['anomaly_severity']} "
-        f"with an Isolation Forest score of {latest['anomaly_score']:.5f}. "
-        f"Recommended action: {recommendation}"
-    )
-
-    if "surchauffe" in normalized or "vibration" in normalized:
-        answer += (
-            " Based on the latest drivers, this looks more related to "
-            f"{'vibration' if latest['vibration'] >= BUSINESS_THRESHOLDS['vibration_warning'] else 'temperature' if latest['temperature'] >= BUSINESS_THRESHOLDS['temperature_warning'] else 'a combined weak signal'}."
+    elif "rapport" in normalized or "resume" in normalized or "résume" in normalized:
+        report = generate_report()
+        response = AgentResponse(
+            answer=report,
+            sources=["sqlite:anomalies", "report_generator"],
+            risk_level="summary",
+            recommendation="Review the most affected machines and critical alerts first.",
+            data_used={"metrics": metrics},
         )
+    elif "surchauffe" in normalized or "overheat" in normalized or "temperature" in normalized:
+        overheating = anomalies[anomalies["temperature"] >= BUSINESS_THRESHOLDS["temperature_warning"]]
+        count = len(overheating)
+        response = AgentResponse(
+            answer=f"There are {count} recent anomalies with elevated temperature signals.",
+            sources=["sqlite:anomalies"],
+            risk_level="high" if count else "normal",
+            recommendation="Inspect cooling and high-load operating periods when temperature anomalies repeat.",
+            data_used={"temperature_anomaly_count": count},
+        )
+    else:
+        latest = anomalies.iloc[0]
+        response = _machine_answer(question, str(latest["machine_id"]), anomalies)
 
-    return AgentResponse(answer=_maybe_llm_rewrite(answer, question), sources=sources).__dict__
+    CONVERSATION_MEMORY.append({"question": question, "answer": response.answer[:500]})
+    response.data_used["conversation_memory_size"] = len(CONVERSATION_MEMORY)
+    return _maybe_llm_rewrite(response, question).__dict__
 
 
 def main() -> None:
-    question = "Résume les anomalies récentes."
-    response = answer_question(question)
+    response = answer_question("Resume les anomalies recentes.")
     print(response["answer"])
 
 
 if __name__ == "__main__":
     main()
+

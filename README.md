@@ -184,10 +184,22 @@ Pathway is used for actual pipeline definition and execution when the real Pathw
 
 The anomaly model uses `IsolationForest` from scikit-learn. Numeric features are standardized with `StandardScaler`, and the scaler is saved together with the model in `models/anomaly_model.pkl`.
 
+V2 adds feature engineering:
+
+- `temperature_delta`
+- `vibration_delta`
+- `power_ratio`
+- `pressure_ratio`
+- `rolling_mean_temperature`
+- `rolling_mean_vibration`
+- `rolling_std_temperature`
+- `rolling_std_vibration`
+
 The final severity combines:
 
 - Isolation Forest anomaly score;
 - business thresholds for temperature, pressure, vibration, power consumption, and motor speed;
+- operating-mode-aware thresholds;
 - optional health index when available.
 
 Severity levels:
@@ -198,11 +210,28 @@ Severity levels:
 - high
 - critical
 
+When simulated labels are available, training also writes `models/evaluation_metrics.json` with precision, recall, and F1-score.
+
+Current simulated-label evaluation after `python -m app.bootstrap_demo`:
+
+- Precision: 0.6385
+- Recall: 0.8127
+- F1-score: 0.7152
+- Evaluated rows: 10,000
+
 ## AI Agent
 
-The V1 assistant is rule-based and robust without an API key. It reads SQLite anomalies, identifies the likely signal drivers, explains why a machine is in alert, and recommends a technical action.
+The V2 assistant is rule-based and robust without an API key. It exposes structured tools internally:
 
-The code is structured for future LangGraph/OpenAI integration through tool-like functions and a dedicated rewrite extension point. If `OPENAI_API_KEY` is absent, the local deterministic fallback is used.
+- `get_latest_anomalies`
+- `get_machine_status`
+- `get_machine_history`
+- `get_global_metrics`
+- `generate_report`
+
+It reads SQLite anomalies, identifies likely signal drivers, returns a risk level, explains why a machine is in alert, and recommends a technical action.
+
+The code is structured for future LangGraph integration through tool-like functions and a dedicated rewrite extension point. If `OPENAI_API_KEY` is absent, the local deterministic fallback is used.
 
 ## API Documentation
 
@@ -223,9 +252,13 @@ Endpoints:
 - `GET /`
 - `GET /health`
 - `GET /metrics`
+- `GET /dashboard/summary`
 - `GET /events/latest`
 - `GET /anomalies/latest`
 - `GET /anomalies/{machine_id}`
+- `GET /machines`
+- `GET /machines/{machine_id}/status`
+- `GET /machines/{machine_id}/history`
 - `GET /report`
 - `POST /agent/query`
 
@@ -268,6 +301,12 @@ pip install -r requirements.txt
 ## Run Locally
 
 Initialize data and model:
+
+```powershell
+python -m app.bootstrap_demo
+```
+
+Manual initialization is still available:
 
 ```powershell
 python -m app.data_generator
@@ -337,7 +376,6 @@ pytest
 ## Future Improvements
 
 - Add LangGraph orchestration for the assistant.
-- Add OpenAI-based answer rewriting when an API key is configured.
 - Store stream output directly in SQLite from the processing layer.
 - Add model monitoring and drift detection.
 - Add richer sensor profiles per machine type.

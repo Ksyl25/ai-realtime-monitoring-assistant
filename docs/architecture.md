@@ -67,7 +67,11 @@ The module also includes a one-shot pandas fallback for local environments where
 
 The anomaly detector uses `IsolationForest`, an unsupervised algorithm suitable for identifying rare behavior in numeric sensor patterns. A `StandardScaler` is fitted during training and saved in the same `joblib` artifact as the model.
 
-Severity is not based on the model alone. The project combines ML scores with simple business thresholds to make alerts more interpretable.
+Severity is not based on the model alone. The project combines ML scores with operating-mode-aware business thresholds to make alerts more interpretable.
+
+V2 feature engineering adds deltas, ratios, rolling means, and rolling standard deviations so the model can detect both point anomalies and short-term degradation patterns.
+
+When simulated labels are available, training writes `models/evaluation_metrics.json` with precision, recall, and F1-score. These metrics are useful for portfolio storytelling, while still being honest that the labels are synthetic.
 
 ## Role of FastAPI
 
@@ -75,6 +79,10 @@ FastAPI exposes operational endpoints:
 
 - health checks;
 - global metrics;
+- dashboard summary;
+- machine list;
+- machine status;
+- machine history;
 - latest events;
 - latest anomalies;
 - machine-specific anomalies;
@@ -98,6 +106,6 @@ Streamlit provides a practical dashboard for recruiters and technical reviewers:
 
 ## Role of the AI Agent
 
-The V1 agent is deterministic and rule-based. It reads recent anomalies and metrics from SQLite, identifies likely signal drivers, and produces natural-language recommendations.
+The V2 agent is deterministic and rule-based by default. It reads recent anomalies and metrics from SQLite, identifies likely signal drivers, returns a risk level, and produces natural-language recommendations.
 
-The agent module is intentionally structured with tool-like functions such as `get_machine_history`, `get_global_metrics`, and report generation so it can later be replaced or extended with LangGraph and an LLM.
+The agent module is intentionally structured with tool-like functions such as `get_latest_anomalies`, `get_machine_status`, `get_machine_history`, `get_global_metrics`, and `generate_report` so it can later be replaced or extended with LangGraph.

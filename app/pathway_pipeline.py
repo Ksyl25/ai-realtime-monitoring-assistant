@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from app.config import PROCESSED_STREAM_PATH, STREAM_DATA_DIR, ensure_directories
+from app.config import MODE_THRESHOLDS, PROCESSED_STREAM_PATH, STREAM_DATA_DIR, ensure_directories
 
 
 def calculate_health_index(
@@ -23,14 +23,20 @@ def calculate_health_index(
     vibration: float,
     power_consumption: float,
     motor_speed: float,
+    operating_mode: str = "normal",
 ) -> float:
     """Business health score from 0 to 100, where lower means riskier."""
+    thresholds = MODE_THRESHOLDS.get(str(operating_mode), MODE_THRESHOLDS["normal"])
     penalty = 0.0
-    penalty += max(0.0, temperature - 78.0) * 1.8
-    penalty += max(0.0, pressure - 5.8) * 8.0
-    penalty += max(0.0, vibration - 0.45) * 35.0
-    penalty += max(0.0, power_consumption - 620.0) * 0.05
-    penalty += max(0.0, 1150.0 - motor_speed) * 0.04
+    penalty += max(0.0, temperature - thresholds["temperature_warning"]) * 1.8
+    penalty += max(0.0, pressure - thresholds["pressure_warning"]) * 8.0
+    penalty += max(0.0, vibration - thresholds["vibration_warning"]) * 35.0
+    penalty += max(0.0, power_consumption - thresholds["power_warning"]) * 0.05
+    penalty += max(0.0, thresholds["motor_speed_low_warning"] - motor_speed) * 0.04
+    if operating_mode == "high_load":
+        penalty *= 0.85
+    elif operating_mode == "idle":
+        penalty *= 1.1
     return round(max(0.0, min(100.0, 100.0 - penalty)), 2)
 
 
@@ -48,11 +54,16 @@ def run_pandas_fallback() -> pd.DataFrame:
             row["vibration"],
             row["power_consumption"],
             row["motor_speed"],
+            row.get("operating_mode", "normal"),
         ),
         axis=1,
     )
     df.to_csv(PROCESSED_STREAM_PATH, index=False)
+    from app.database import insert_sensor_events
+
+    inserted = insert_sensor_events(df)
     print(f"Processed {len(df)} rows with pandas one-shot mode at {PROCESSED_STREAM_PATH}")
+    print(f"Inserted {inserted} processed events into SQLite")
     return df
 
 
@@ -98,6 +109,7 @@ def run_pathway_pipeline() -> None:
         vibration: float,
         power_consumption: float,
         motor_speed: float,
+        operating_mode: str,
     ) -> float:
         return calculate_health_index(
             temperature,
@@ -105,6 +117,7 @@ def run_pathway_pipeline() -> None:
             vibration,
             power_consumption,
             motor_speed,
+            operating_mode,
         )
 
     stream = pw.io.csv.read(
@@ -128,6 +141,7 @@ def run_pathway_pipeline() -> None:
             pw.this.vibration,
             pw.this.power_consumption,
             pw.this.motor_speed,
+            pw.this.operating_mode,
         ),
     )
 

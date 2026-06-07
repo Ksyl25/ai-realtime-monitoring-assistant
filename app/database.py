@@ -55,6 +55,7 @@ def init_db(db_path: str | Path = DATABASE_PATH) -> None:
                 vibration REAL NOT NULL,
                 power_consumption REAL NOT NULL,
                 motor_speed REAL NOT NULL,
+                anomaly_reason TEXT,
                 explanation TEXT,
                 created_at TEXT NOT NULL
             )
@@ -70,6 +71,12 @@ def init_db(db_path: str | Path = DATABASE_PATH) -> None:
             )
             """
         )
+        existing_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(anomalies)").fetchall()
+        }
+        if "anomaly_reason" not in existing_columns:
+            conn.execute("ALTER TABLE anomalies ADD COLUMN anomaly_reason TEXT")
 
 
 def _records_from_df(df: pd.DataFrame, columns: list[str]) -> list[dict[str, object]]:
@@ -129,11 +136,14 @@ def insert_anomalies(df: pd.DataFrame, db_path: str | Path = DATABASE_PATH) -> i
         return 0
     if "explanation" not in anomalies.columns:
         anomalies["explanation"] = ""
+    if "anomaly_reason" not in anomalies.columns:
+        anomalies["anomaly_reason"] = ""
     columns = [
         "timestamp",
         "machine_id",
         "anomaly_score",
         "anomaly_severity",
+        "anomaly_reason",
         *NUMERIC_FEATURES,
         "explanation",
     ]
@@ -142,12 +152,12 @@ def insert_anomalies(df: pd.DataFrame, db_path: str | Path = DATABASE_PATH) -> i
         conn.executemany(
             """
             INSERT INTO anomalies (
-                timestamp, machine_id, anomaly_score, anomaly_severity,
+                timestamp, machine_id, anomaly_score, anomaly_severity, anomaly_reason,
                 temperature, pressure, vibration, power_consumption, motor_speed,
                 explanation, created_at
             )
             VALUES (
-                :timestamp, :machine_id, :anomaly_score, :anomaly_severity,
+                :timestamp, :machine_id, :anomaly_score, :anomaly_severity, :anomaly_reason,
                 :temperature, :pressure, :vibration, :power_consumption, :motor_speed,
                 :explanation, :created_at
             )
@@ -187,6 +197,59 @@ def get_machine_anomalies(machine_id: str, limit: int = 100, db_path: str | Path
         )
 
 
+def get_machine_history(machine_id: str, limit: int = 200, db_path: str | Path = DATABASE_PATH) -> pd.DataFrame:
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        return pd.read_sql_query(
+            "SELECT * FROM sensor_events WHERE machine_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
+            conn,
+            params=(machine_id, limit),
+        )
+
+
+def get_machines(db_path: str | Path = DATABASE_PATH) -> list[str]:
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute("SELECT DISTINCT machine_id FROM sensor_events ORDER BY machine_id").fetchall()
+    return [row["machine_id"] for row in rows]
+
+
+def get_machine_status(machine_id: str, db_path: str | Path = DATABASE_PATH) -> dict[str, object]:
+    history = get_machine_history(machine_id, limit=100, db_path=db_path)
+    anomalies = get_machine_anomalies(machine_id, limit=20, db_path=db_path)
+    if history.empty:
+        return {
+            "machine_id": machine_id,
+            "status": "unknown",
+            "health_index": None,
+            "latest_event": None,
+            "recent_anomalies": 0,
+            "recommendation": "No data available. Run python -m app.bootstrap_demo.",
+        }
+    latest = history.iloc[0].to_dict()
+    health = latest.get("health_index")
+    recent_critical = (
+        not anomalies.empty and (anomalies["anomaly_severity"] == "critical").any()
+    )
+    if recent_critical or (health is not None and health < 45):
+        status = "critical"
+        recommendation = "Schedule immediate inspection before sustained load."
+    elif not anomalies.empty or (health is not None and health < 70):
+        status = "warning"
+        recommendation = "Monitor trend and inspect dominant signals."
+    else:
+        status = "normal"
+        recommendation = "Continue monitoring under normal operation."
+    return {
+        "machine_id": machine_id,
+        "status": status,
+        "health_index": round(float(health), 2) if health is not None else None,
+        "latest_event": latest,
+        "recent_anomalies": int(len(anomalies)),
+        "recommendation": recommendation,
+    }
+
+
 def get_metrics(db_path: str | Path = DATABASE_PATH) -> dict[str, object]:
     init_db(db_path)
     with get_connection(db_path) as conn:
@@ -204,12 +267,16 @@ def get_metrics(db_path: str | Path = DATABASE_PATH) -> dict[str, object]:
             LIMIT 1
             """
         ).fetchone()
+        average_health = conn.execute(
+            "SELECT AVG(health_index) FROM sensor_events WHERE health_index IS NOT NULL"
+        ).fetchone()[0]
     return {
         "total_events": int(total_events),
         "total_anomalies": int(total_anomalies),
         "anomaly_rate": round(total_anomalies / total_events, 4) if total_events else 0.0,
         "most_affected_machine": most_affected["machine_id"] if most_affected else None,
         "critical_alerts": int(critical_alerts),
+        "average_health_score": round(float(average_health), 2) if average_health is not None else 0.0,
     }
 
 

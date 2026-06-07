@@ -10,9 +10,12 @@ from pydantic import BaseModel
 
 from app.agent import answer_question
 from app.database import (
+    get_machine_history,
     get_latest_anomalies,
     get_latest_events,
+    get_machine_status,
     get_machine_anomalies,
+    get_machines,
     get_metrics,
     init_db,
     save_report,
@@ -29,7 +32,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="AI Realtime Monitoring Assistant",
     description="Prototype API for simulated industrial machine monitoring.",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -58,6 +61,41 @@ def health() -> dict[str, str]:
 @app.get("/metrics")
 def metrics() -> dict[str, object]:
     return get_metrics()
+
+
+@app.get("/dashboard/summary")
+def dashboard_summary() -> dict[str, object]:
+    metrics_payload = get_metrics()
+    events = get_latest_events(limit=500)
+    anomalies = get_latest_anomalies(limit=200)
+    return {
+        "metrics": metrics_payload,
+        "machines": get_machines(),
+        "latest_events_count": len(events),
+        "latest_anomalies_count": len(anomalies),
+        "summary": (
+            f"{metrics_payload['total_events']} events, "
+            f"{metrics_payload['total_anomalies']} anomalies, "
+            f"{metrics_payload['anomaly_rate']:.2%} anomaly rate."
+        ),
+    }
+
+
+@app.get("/machines")
+def machines() -> dict[str, object]:
+    machine_ids = get_machines()
+    return {"count": len(machine_ids), "machines": machine_ids}
+
+
+@app.get("/machines/{machine_id}/status")
+def machine_status(machine_id: str) -> dict[str, object]:
+    return get_machine_status(machine_id.upper())
+
+
+@app.get("/machines/{machine_id}/history")
+def machine_history(machine_id: str, limit: int = 200) -> dict[str, object]:
+    df = get_machine_history(machine_id=machine_id.upper(), limit=limit)
+    return {"count": len(df), "machine_id": machine_id.upper(), "events": _records(df)}
 
 
 @app.get("/events/latest")

@@ -46,6 +46,7 @@ def _prepare_processed_demo_events(df: pd.DataFrame, n_rows: int = 750) -> pd.Da
             row["vibration"],
             row["power_consumption"],
             row["motor_speed"],
+            row.get("operating_mode", "normal"),
         ),
         axis=1,
     )
@@ -111,4 +112,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

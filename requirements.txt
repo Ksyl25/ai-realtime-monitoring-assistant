@@ -1,0 +1,15 @@
+pathway
+pandas
+numpy
+scikit-learn
+fastapi
+uvicorn
+streamlit
+matplotlib
+plotly
+joblib
+pytest
+python-dotenv
+requests
+httpx
+

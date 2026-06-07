@@ -1,0 +1,13 @@
+venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+models/*.pkl
+data/raw/*.csv
+data/stream/*.csv
+data/processed/*.csv
+*.db
+work/
+

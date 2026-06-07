@@ -4,7 +4,7 @@
 
 AI Realtime Monitoring Assistant is a clean V1 prototype for continuous monitoring of simulated industrial machines.
 
-It demonstrates a realistic AI/Data architecture with simulated sensor streams, Pathway-based stream processing, anomaly detection, SQLite persistence, a FastAPI service, a Streamlit dashboard, and an explanatory AI assistant.
+The V2 turns it into a portfolio-ready AI/Data Engineering project with simulated sensor streams, Pathway-based stream processing, anomaly detection, SQLite persistence, a FastAPI service, a Streamlit monitoring dashboard, and an explanatory AI assistant.
 
 Important: all data is simulated. This project does not use real industrial data and is not intended for production deployment.
 
@@ -16,6 +16,8 @@ This prototype simulates that use case for five machines and shows how an AI/Dat
 
 ## Key Features
 
+- One-command recruiter demo bootstrap.
+- Streamlit V2 dashboard with Overview, Live Monitoring, Machine Details, Anomalies, AI Assistant, Reports, and Project Info pages.
 - Historical sensor data generation with realistic operating modes.
 - Continuous stream simulator writing append-only CSV events.
 - Pathway pipeline for streaming ingestion and transformation.
@@ -27,6 +29,54 @@ This prototype simulates that use case for five machines and shows how an AI/Dat
 - Rule-based AI assistant that explains recent anomalies and recommends actions.
 - Pytest coverage for data generation, model behavior, reports, and API endpoints.
 - Docker and Docker Compose support.
+- GitHub Actions test workflow.
+
+## Recruiter Demo In 5 Minutes
+
+Use this scenario in an interview or portfolio walkthrough:
+
+1. Prepare the full local demo:
+
+```powershell
+python -m app.bootstrap_demo
+```
+
+2. Start the API:
+
+```powershell
+uvicorn app.api:app --reload
+```
+
+3. Open Swagger:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+4. Start the dashboard:
+
+```powershell
+streamlit run app/dashboard.py
+```
+
+5. Show the story:
+
+- The data is simulated, realistic, and explicitly labeled as a prototype.
+- Pathway processes incoming stream files and computes health scores.
+- Isolation Forest detects anomalies, enriched by business thresholds.
+- SQLite stores events, anomalies, and reports.
+- FastAPI exposes monitoring endpoints.
+- Streamlit makes the system understandable for non-technical reviewers.
+- The assistant explains why a machine is in alert and recommends action.
+
+## Screenshots
+
+Placeholders are provided in `docs/screenshots/` so real dashboard screenshots can be added after running the demo:
+
+- `overview.png`
+- `live_monitoring.png`
+- `machine_details.png`
+- `ai_assistant.png`
 
 ## Architecture
 
@@ -199,9 +249,11 @@ Sections:
 
 - Overview
 - Live Monitoring
+- Machine Details
 - Anomalies
 - AI Assistant
 - Reports
+- Project Info
 
 The dashboard reads SQLite directly for simplicity and reliability.
 

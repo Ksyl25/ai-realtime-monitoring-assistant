@@ -1,4 +1,4 @@
-# Architecture
+# Architecture V2
 
 This project is a prototype for continuous monitoring of simulated industrial machines.
 It does not use real industrial data and is not production software.
@@ -28,6 +28,23 @@ Streaming simulator --> data/stream/*.csv --> Pathway pipeline --> data/processe
                               |
                               v
                        Rule-based AI assistant
+```
+
+## V2 Portfolio Flow
+
+```text
+python -m app.bootstrap_demo
+        |
+        +--> data/raw/historical_sensor_data.csv
+        +--> models/anomaly_model.pkl
+        +--> data/processed/stream_processed.csv
+        +--> data/processed/stream_anomalies.csv
+        +--> monitoring.db
+        +--> Markdown report stored in SQLite
+
+FastAPI reads monitoring.db --> JSON endpoints and Swagger docs
+Streamlit reads monitoring.db --> portfolio dashboard with 7 pages
+Agent reads monitoring.db --> explanations, risk level, recommendations
 ```
 
 ## Data Flow
@@ -72,6 +89,8 @@ Streamlit provides a practical dashboard for recruiters and technical reviewers:
 
 - overview metrics;
 - time-series charts;
+- machine detail cards;
+- anomaly timeline and filters;
 - health index by machine;
 - latest event and anomaly tables;
 - AI assistant question box;
@@ -82,4 +101,3 @@ Streamlit provides a practical dashboard for recruiters and technical reviewers:
 The V1 agent is deterministic and rule-based. It reads recent anomalies and metrics from SQLite, identifies likely signal drivers, and produces natural-language recommendations.
 
 The agent module is intentionally structured with tool-like functions such as `get_machine_history`, `get_global_metrics`, and report generation so it can later be replaced or extended with LangGraph and an LLM.
-

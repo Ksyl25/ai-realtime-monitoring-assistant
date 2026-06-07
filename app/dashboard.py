@@ -32,6 +32,14 @@ STATUS_COLORS = {
     "Critical": "#dc2626",
 }
 
+RECENT_ANOMALY_WINDOW_HOURS = 6
+ANOMALY_PENALTIES = {
+    "low": 5,
+    "medium": 15,
+    "high": 30,
+    "critical": 45,
+}
+
 
 @st.cache_data(ttl=5)
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
@@ -56,21 +64,100 @@ def _latest_by_machine(events: pd.DataFrame) -> pd.DataFrame:
     return ordered.dropna(subset=["timestamp"]).groupby("machine_id", as_index=False).tail(1)
 
 
-def _machine_status(row: pd.Series, anomalies: pd.DataFrame) -> tuple[str, str]:
-    recent = anomalies[anomalies["machine_id"] == row["machine_id"]] if not anomalies.empty else anomalies
-    health = float(row.get("health_index") or 100)
-    has_critical = not recent.empty and (recent["anomaly_severity"] == "critical").any()
-    if has_critical or health < 45:
-        return "Critical", "Immediate inspection recommended."
-    if not recent.empty or health < 70:
-        return "Warning", "Review recent signals and monitor trend."
-    return "Normal", "No urgent action required."
+def _reference_time(events: pd.DataFrame, anomalies: pd.DataFrame) -> pd.Timestamp | None:
+    timestamps = []
+    for df in [events, anomalies]:
+        if not df.empty and "timestamp" in df.columns:
+            parsed = pd.to_datetime(df["timestamp"], errors="coerce").dropna()
+            if not parsed.empty:
+                timestamps.append(parsed.max())
+    if not timestamps:
+        return None
+    return max(timestamps)
 
 
-def _average_health(events: pd.DataFrame) -> float:
-    if events.empty or "health_index" not in events.columns:
+def _recent_anomalies_for_machine(
+    machine_id: str,
+    anomalies: pd.DataFrame,
+    reference_time: pd.Timestamp | None,
+    window_hours: int = RECENT_ANOMALY_WINDOW_HOURS,
+) -> pd.DataFrame:
+    if anomalies.empty or reference_time is None:
+        return anomalies.iloc[0:0].copy()
+    prepared = _as_datetime(anomalies)
+    cutoff = reference_time - pd.Timedelta(hours=window_hours)
+    return prepared[
+        (prepared["machine_id"] == machine_id)
+        & (prepared["timestamp"].notna())
+        & (prepared["timestamp"] >= cutoff)
+    ].copy()
+
+
+def _recent_anomaly_penalty(recent_anomalies: pd.DataFrame) -> int:
+    if recent_anomalies.empty or "anomaly_severity" not in recent_anomalies.columns:
+        return 0
+    severities = recent_anomalies["anomaly_severity"].fillna("").str.lower()
+    return int(sum(ANOMALY_PENALTIES.get(severity, 0) for severity in severities))
+
+
+def _clamp_health(value: float) -> float:
+    return round(max(0.0, min(100.0, value)), 1)
+
+
+def _status_from_health(final_health_score: float, recent_anomalies: pd.DataFrame) -> str:
+    severities = (
+        set(recent_anomalies["anomaly_severity"].fillna("").str.lower())
+        if not recent_anomalies.empty and "anomaly_severity" in recent_anomalies.columns
+        else set()
+    )
+    if final_health_score < 50 or "critical" in severities:
+        return "Critical"
+    if final_health_score < 75 or severities.intersection({"medium", "high"}):
+        return "Warning"
+    return "Normal"
+
+
+def _recommendation_from_status(status: str) -> str:
+    if status == "Critical":
+        return "Immediate inspection recommended before sustained operation."
+    if status == "Warning":
+        return "Review recent anomalies and monitor the next operating cycle."
+    return "No urgent action required."
+
+
+def _machine_health_snapshot(events: pd.DataFrame, anomalies: pd.DataFrame) -> pd.DataFrame:
+    latest = _latest_by_machine(events)
+    if latest.empty:
+        return latest
+
+    reference_time = _reference_time(events, anomalies)
+    snapshots: list[dict[str, object]] = []
+    for _, row in latest.iterrows():
+        machine_id = str(row["machine_id"])
+        latest_sensor_health = _clamp_health(float(row.get("health_index") or 100.0))
+        recent = _recent_anomalies_for_machine(machine_id, anomalies, reference_time)
+        penalty = _recent_anomaly_penalty(recent)
+        final_health_score = _clamp_health(latest_sensor_health - penalty)
+        status = _status_from_health(final_health_score, recent)
+        snapshots.append(
+            {
+                **row.to_dict(),
+                "latest_sensor_health": latest_sensor_health,
+                "recent_anomaly_penalty": penalty,
+                "final_health_score": final_health_score,
+                "status": status,
+                "recent_anomaly_count": int(len(recent)),
+                "recommendation": _recommendation_from_status(status),
+            }
+        )
+    return pd.DataFrame(snapshots)
+
+
+def _average_final_health(events: pd.DataFrame, anomalies: pd.DataFrame) -> float:
+    snapshots = _machine_health_snapshot(events, anomalies)
+    if snapshots.empty or "final_health_score" not in snapshots.columns:
         return 0.0
-    return float(events["health_index"].dropna().mean()) if events["health_index"].notna().any() else 0.0
+    return float(snapshots["final_health_score"].dropna().mean())
 
 
 def _global_summary(metrics: dict[str, object], average_health: float) -> str:
@@ -90,27 +177,27 @@ def _global_summary(metrics: dict[str, object], average_health: float) -> str:
     )
 
 
-def render_metric_cards(events: pd.DataFrame, metrics: dict[str, object]) -> None:
+def render_metric_cards(events: pd.DataFrame, anomalies: pd.DataFrame, metrics: dict[str, object]) -> None:
     cols = st.columns(6)
     cols[0].metric("Total events", metrics["total_events"])
     cols[1].metric("Anomalies", metrics["total_anomalies"])
     cols[2].metric("Anomaly rate", f"{metrics['anomaly_rate']:.2%}")
     cols[3].metric("Critical alerts", metrics["critical_alerts"])
     cols[4].metric("Most affected", metrics["most_affected_machine"] or "n/a")
-    cols[5].metric("Avg health", f"{_average_health(events):.1f}")
+    cols[5].metric("Avg final health", f"{_average_final_health(events, anomalies):.1f}")
 
 
 def render_overview(events: pd.DataFrame, anomalies: pd.DataFrame, metrics: dict[str, object]) -> None:
     st.title("AI Realtime Monitoring Assistant")
     st.caption("Portfolio V2 - simulated industrial monitoring. No real industrial data is used.")
-    render_metric_cards(events, metrics)
-    st.info(_global_summary(metrics, _average_health(events)))
+    render_metric_cards(events, anomalies, metrics)
+    st.info(_global_summary(metrics, _average_final_health(events, anomalies)))
 
     if events.empty:
         st.warning("No monitoring data yet. Run: python -m app.bootstrap_demo")
         return
 
-    latest = _latest_by_machine(events)
+    machine_health = _machine_health_snapshot(events, anomalies)
     anomaly_counts = anomalies.groupby("machine_id").size().reset_index(name="anomalies") if not anomalies.empty else pd.DataFrame(columns=["machine_id", "anomalies"])
     totals = events.groupby("machine_id").size().reset_index(name="events")
     rate = totals.merge(anomaly_counts, on="machine_id", how="left").fillna(0)
@@ -124,7 +211,13 @@ def render_overview(events: pd.DataFrame, anomalies: pd.DataFrame, metrics: dict
         )
     with right:
         st.plotly_chart(
-            px.bar(latest, x="machine_id", y="health_index", title="Latest health score by machine"),
+            px.bar(
+                machine_health,
+                x="machine_id",
+                y="final_health_score",
+                color="status",
+                title="Final health score by machine",
+            ),
             use_container_width=True,
         )
 
@@ -158,9 +251,10 @@ def render_machine_details(events: pd.DataFrame, anomalies: pd.DataFrame) -> Non
         st.warning("No machine data available.")
         return
 
-    latest = _latest_by_machine(events)
-    for _, row in latest.sort_values("machine_id").iterrows():
-        status, recommendation = _machine_status(row, anomalies)
+    machine_health = _machine_health_snapshot(events, anomalies)
+    for _, row in machine_health.sort_values("machine_id").iterrows():
+        status = str(row["status"])
+        recommendation = str(row["recommendation"])
         color = STATUS_COLORS[status]
         with st.container(border=True):
             st.markdown(
@@ -168,13 +262,18 @@ def render_machine_details(events: pd.DataFrame, anomalies: pd.DataFrame) -> Non
                 f"<span style='color:{color}; font-size:0.9rem'>[{status}]</span>",
                 unsafe_allow_html=True,
             )
-            cols = st.columns(6)
-            cols[0].metric("Health", f"{row.get('health_index', 0):.1f}")
-            cols[1].metric("Temp", f"{row['temperature']:.1f}")
-            cols[2].metric("Vibration", f"{row['vibration']:.3f}")
-            cols[3].metric("Pressure", f"{row['pressure']:.2f}")
-            cols[4].metric("Power", f"{row['power_consumption']:.0f}")
-            cols[5].metric("Speed", f"{row['motor_speed']:.0f}")
+            score_cols = st.columns(4)
+            score_cols[0].metric("Sensor health", f"{row['latest_sensor_health']:.1f}")
+            score_cols[1].metric("Recent anomaly penalty", f"-{int(row['recent_anomaly_penalty'])}")
+            score_cols[2].metric("Final health score", f"{row['final_health_score']:.1f}")
+            score_cols[3].metric("Status", status)
+
+            signal_cols = st.columns(5)
+            signal_cols[0].metric("Temp", f"{row['temperature']:.1f}")
+            signal_cols[1].metric("Vibration", f"{row['vibration']:.3f}")
+            signal_cols[2].metric("Pressure", f"{row['pressure']:.2f}")
+            signal_cols[3].metric("Power", f"{row['power_consumption']:.0f}")
+            signal_cols[4].metric("Speed", f"{row['motor_speed']:.0f}")
             recent = anomalies[anomalies["machine_id"] == row["machine_id"]].head(5) if not anomalies.empty else anomalies
             st.write(f"Recommendation: {recommendation}")
             if not recent.empty:

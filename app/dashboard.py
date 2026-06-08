@@ -14,9 +14,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.agent import answer_question
-from app.config import MACHINES, NUMERIC_FEATURES
+from app.config import MACHINES, MODE_THRESHOLDS, NUMERIC_FEATURES
 from app.database import get_latest_anomalies, get_latest_events, get_metrics, init_db
 from app.report_generator import generate_monitoring_report
+from app.root_cause import analyze_root_cause, signal_flags
 
 
 st.set_page_config(
@@ -31,6 +32,11 @@ STATUS_COLORS = {
     "Warning": "#d97706",
     "Critical": "#dc2626",
 }
+STATUS_RISK = {
+    "Normal": "Low",
+    "Warning": "Medium",
+    "Critical": "High",
+}
 
 RECENT_ANOMALY_WINDOW_HOURS = 6
 ANOMALY_PENALTIES = {
@@ -39,6 +45,67 @@ ANOMALY_PENALTIES = {
     "high": 30,
     "critical": 45,
 }
+SENSOR_PENALTIES = {
+    "temperature": {"warning": 10, "critical": 25},
+    "vibration": {"warning": 15, "critical": 35},
+    "pressure": {"warning": 10, "critical": 20},
+    "power_consumption": {"warning": 10, "critical": 20},
+    "motor_speed": {"warning": 15, "critical": 30},
+}
+
+
+st.markdown(
+    """
+    <style>
+    .monitor-card {
+        border: 1px solid #d8dee9;
+        border-radius: 8px;
+        padding: 14px 16px;
+        background: #ffffff;
+        min-height: 94px;
+    }
+    .monitor-label {
+        color: #607086;
+        font-size: 0.78rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+    }
+    .monitor-value {
+        color: #172033;
+        font-size: 1.55rem;
+        font-weight: 800;
+        margin-top: 4px;
+    }
+    .monitor-subtle {
+        color: #69778c;
+        font-size: 0.88rem;
+    }
+    .status-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        margin: 10px 0 18px 0;
+    }
+    .status-pill {
+        border-radius: 999px;
+        padding: 7px 12px;
+        color: white;
+        font-weight: 700;
+        font-size: 0.85rem;
+    }
+    .section-title {
+        margin-top: 0.8rem;
+        margin-bottom: 0.4rem;
+        color: #253044;
+        font-size: 1rem;
+        font-weight: 800;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 @st.cache_data(ttl=5)
@@ -97,11 +164,185 @@ def _recent_anomaly_penalty(recent_anomalies: pd.DataFrame) -> int:
     if recent_anomalies.empty or "anomaly_severity" not in recent_anomalies.columns:
         return 0
     severities = recent_anomalies["anomaly_severity"].fillna("").str.lower()
-    return int(sum(ANOMALY_PENALTIES.get(severity, 0) for severity in severities))
+    return min(100, int(sum(ANOMALY_PENALTIES.get(severity, 0) for severity in severities)))
+
+
+def _thresholds_for_row(row: pd.Series) -> dict[str, float]:
+    mode = str(row.get("operating_mode", "normal"))
+    return MODE_THRESHOLDS.get(mode, MODE_THRESHOLDS["normal"])
+
+
+def _sensor_health_score(row: pd.Series) -> float:
+    thresholds = _thresholds_for_row(row)
+    penalty = 0
+
+    if row["temperature"] >= thresholds["temperature_critical"]:
+        penalty += SENSOR_PENALTIES["temperature"]["critical"]
+    elif row["temperature"] >= thresholds["temperature_warning"]:
+        penalty += SENSOR_PENALTIES["temperature"]["warning"]
+
+    if row["vibration"] >= thresholds["vibration_critical"]:
+        penalty += SENSOR_PENALTIES["vibration"]["critical"]
+    elif row["vibration"] >= thresholds["vibration_warning"]:
+        penalty += SENSOR_PENALTIES["vibration"]["warning"]
+
+    if row["pressure"] >= thresholds["pressure_critical"]:
+        penalty += SENSOR_PENALTIES["pressure"]["critical"]
+    elif row["pressure"] >= thresholds["pressure_warning"]:
+        penalty += SENSOR_PENALTIES["pressure"]["warning"]
+
+    if row["power_consumption"] >= thresholds["power_critical"]:
+        penalty += SENSOR_PENALTIES["power_consumption"]["critical"]
+    elif row["power_consumption"] >= thresholds["power_warning"]:
+        penalty += SENSOR_PENALTIES["power_consumption"]["warning"]
+
+    if row["motor_speed"] <= thresholds["motor_speed_low_critical"]:
+        penalty += SENSOR_PENALTIES["motor_speed"]["critical"]
+    elif row["motor_speed"] <= thresholds["motor_speed_low_warning"]:
+        penalty += SENSOR_PENALTIES["motor_speed"]["warning"]
+
+    return _clamp_health(100 - min(100, penalty))
 
 
 def _clamp_health(value: float) -> float:
     return round(max(0.0, min(100.0, value)), 1)
+
+
+def _render_card(column, label: str, value: object, color: str | None = None) -> None:
+    color_style = f" style='color:{color}'" if color else ""
+    value_style = "font-size:1.0rem; line-height:1.25" if len(str(value)) > 32 else ""
+    value_style = f" style='{value_style}; color:{color}'" if color and value_style else color_style or (f" style='{value_style}'" if value_style else "")
+    column.markdown(
+        f"""
+        <div class="monitor-card">
+            <div class="monitor-label">{label}</div>
+            <div class="monitor-value"{value_style}>{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _sensor_state(row: pd.Series, metric: str) -> tuple[str, str, float, float]:
+    thresholds = _thresholds_for_row(row)
+    value = float(row[metric])
+
+    if metric == "temperature":
+        warning = thresholds["temperature_warning"]
+        critical = thresholds["temperature_critical"]
+        state = "Critical" if value >= critical else "Warning" if value >= warning else "Normal"
+    elif metric == "pressure":
+        warning = thresholds["pressure_warning"]
+        critical = thresholds["pressure_critical"]
+        state = "Critical" if value >= critical else "Warning" if value >= warning else "Normal"
+    elif metric == "vibration":
+        warning = thresholds["vibration_warning"]
+        critical = thresholds["vibration_critical"]
+        state = "Critical" if value >= critical else "Warning" if value >= warning else "Normal"
+    elif metric == "power_consumption":
+        warning = thresholds["power_warning"]
+        critical = thresholds["power_critical"]
+        state = "Critical" if value >= critical else "Warning" if value >= warning else "Normal"
+    else:
+        warning = thresholds["motor_speed_low_warning"]
+        critical = thresholds["motor_speed_low_critical"]
+        state = "Critical" if value <= critical else "Warning" if value <= warning else "Normal"
+
+    return state, STATUS_COLORS[state], warning, critical
+
+
+def _render_sensor_card(column, label: str, row: pd.Series, metric: str, unit: str) -> None:
+    state, color, warning, critical = _sensor_state(row, metric)
+    value = float(row[metric])
+    precision = 3 if metric == "vibration" else 1 if metric in {"temperature", "pressure"} else 0
+    formatted_value = f"{value:.{precision}f} {unit}".strip()
+    column.markdown(
+        f"""
+        <div class="monitor-card">
+            <div class="monitor-label">{label}</div>
+            <div class="monitor-value">{formatted_value}</div>
+            <div class="monitor-subtle" style="color:{color}; font-weight:700">{state}</div>
+            <div class="monitor-subtle">Warning: {warning:g} | Critical: {critical:g}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _metric_thresholds(metric: str, mode: str = "normal") -> tuple[float | None, float | None]:
+    thresholds = MODE_THRESHOLDS.get(mode, MODE_THRESHOLDS["normal"])
+    if metric == "temperature":
+        return thresholds["temperature_warning"], thresholds["temperature_critical"]
+    if metric == "pressure":
+        return thresholds["pressure_warning"], thresholds["pressure_critical"]
+    if metric == "vibration":
+        return thresholds["vibration_warning"], thresholds["vibration_critical"]
+    if metric == "power_consumption":
+        return thresholds["power_warning"], thresholds["power_critical"]
+    if metric == "motor_speed":
+        return thresholds["motor_speed_low_warning"], thresholds["motor_speed_low_critical"]
+    return None, None
+
+
+def _metric_unit(metric: str) -> str:
+    return {
+        "temperature": "C",
+        "pressure": "bar",
+        "vibration": "",
+        "power_consumption": "W",
+        "motor_speed": "rpm",
+        "health_index": "",
+    }.get(metric, "")
+
+
+def _plot_metric_timeseries(
+    events: pd.DataFrame,
+    anomalies: pd.DataFrame,
+    metric: str,
+    selected_machine: str,
+):
+    fig = px.line(events, x="timestamp", y=metric, color="machine_id", title=f"{metric} over time")
+    mode = "normal"
+    if selected_machine != "All machines" and not events.empty and "operating_mode" in events.columns:
+        mode_values = events["operating_mode"].dropna()
+        if not mode_values.empty:
+            mode = str(mode_values.iloc[-1])
+
+    warning, critical = _metric_thresholds(metric, mode)
+    if warning is not None:
+        fig.add_hline(
+            y=warning,
+            line_dash="dash",
+            line_color="#d97706",
+            annotation_text="warning",
+            annotation_position="top left",
+        )
+    if critical is not None:
+        fig.add_hline(
+            y=critical,
+            line_dash="dash",
+            line_color="#dc2626",
+            annotation_text="critical",
+            annotation_position="top right",
+        )
+
+    if not anomalies.empty and metric in anomalies.columns:
+        marker_data = _as_datetime(anomalies)
+        if selected_machine != "All machines":
+            marker_data = marker_data[marker_data["machine_id"] == selected_machine]
+        marker_data = marker_data.dropna(subset=["timestamp"])
+        if not marker_data.empty:
+            fig.add_scatter(
+                x=marker_data["timestamp"],
+                y=marker_data[metric],
+                mode="markers",
+                name="anomalies",
+                marker={"color": "#dc2626", "size": 9, "symbol": "x"},
+                text=marker_data["anomaly_severity"],
+                hovertemplate="Anomaly<br>%{x}<br>value=%{y}<br>severity=%{text}<extra></extra>",
+            )
+    fig.update_layout(legend_title_text="Machine", margin=dict(l=20, r=20, t=50, b=20))
+    return fig
 
 
 def _status_from_health(final_health_score: float, recent_anomalies: pd.DataFrame) -> str:
@@ -134,11 +375,12 @@ def _machine_health_snapshot(events: pd.DataFrame, anomalies: pd.DataFrame) -> p
     snapshots: list[dict[str, object]] = []
     for _, row in latest.iterrows():
         machine_id = str(row["machine_id"])
-        latest_sensor_health = _clamp_health(float(row.get("health_index") or 100.0))
+        latest_sensor_health = _sensor_health_score(row)
         recent = _recent_anomalies_for_machine(machine_id, anomalies, reference_time)
         penalty = _recent_anomaly_penalty(recent)
         final_health_score = _clamp_health(latest_sensor_health - penalty)
         status = _status_from_health(final_health_score, recent)
+        root_cause = analyze_root_cause(row)
         snapshots.append(
             {
                 **row.to_dict(),
@@ -146,8 +388,12 @@ def _machine_health_snapshot(events: pd.DataFrame, anomalies: pd.DataFrame) -> p
                 "recent_anomaly_penalty": penalty,
                 "final_health_score": final_health_score,
                 "status": status,
+                "risk_level": STATUS_RISK[status],
                 "recent_anomaly_count": int(len(recent)),
                 "recommendation": _recommendation_from_status(status),
+                "probable_cause": root_cause.probable_cause,
+                "root_cause_confidence": root_cause.confidence,
+                "root_cause_action": root_cause.recommended_action,
             }
         )
     return pd.DataFrame(snapshots)
@@ -178,13 +424,18 @@ def _global_summary(metrics: dict[str, object], average_health: float) -> str:
 
 
 def render_metric_cards(events: pd.DataFrame, anomalies: pd.DataFrame, metrics: dict[str, object]) -> None:
+    health = _machine_health_snapshot(events, anomalies)
+    healthy = int((health["status"] == "Normal").sum()) if not health.empty else 0
+    warning = int((health["status"] == "Warning").sum()) if not health.empty else 0
+    critical = int((health["status"] == "Critical").sum()) if not health.empty else 0
+
     cols = st.columns(6)
     cols[0].metric("Total events", metrics["total_events"])
     cols[1].metric("Anomalies", metrics["total_anomalies"])
     cols[2].metric("Anomaly rate", f"{metrics['anomaly_rate']:.2%}")
-    cols[3].metric("Critical alerts", metrics["critical_alerts"])
-    cols[4].metric("Most affected", metrics["most_affected_machine"] or "n/a")
-    cols[5].metric("Avg final health", f"{_average_final_health(events, anomalies):.1f}")
+    cols[3].metric("Healthy", healthy)
+    cols[4].metric("Warning", warning)
+    cols[5].metric("Critical", critical)
 
 
 def render_overview(events: pd.DataFrame, anomalies: pd.DataFrame, metrics: dict[str, object]) -> None:
@@ -198,6 +449,14 @@ def render_overview(events: pd.DataFrame, anomalies: pd.DataFrame, metrics: dict
         return
 
     machine_health = _machine_health_snapshot(events, anomalies)
+    status_badges = []
+    for _, row in machine_health.sort_values("machine_id").iterrows():
+        color = STATUS_COLORS[str(row["status"])]
+        status_badges.append(
+            f"<span class='status-pill' style='background:{color}'>{row['machine_id']} - {row['status']}</span>"
+        )
+    st.markdown("<div class='status-row'>" + "".join(status_badges) + "</div>", unsafe_allow_html=True)
+
     anomaly_counts = anomalies.groupby("machine_id").size().reset_index(name="anomalies") if not anomalies.empty else pd.DataFrame(columns=["machine_id", "anomalies"])
     totals = events.groupby("machine_id").size().reset_index(name="events")
     rate = totals.merge(anomaly_counts, on="machine_id", how="left").fillna(0)
@@ -222,7 +481,7 @@ def render_overview(events: pd.DataFrame, anomalies: pd.DataFrame, metrics: dict
         )
 
 
-def render_live_monitoring(events: pd.DataFrame) -> None:
+def render_live_monitoring(events: pd.DataFrame, anomalies: pd.DataFrame) -> None:
     st.header("Live Monitoring")
     if st.button("Refresh data"):
         st.cache_data.clear()
@@ -238,10 +497,7 @@ def render_live_monitoring(events: pd.DataFrame) -> None:
     if selected_machine != "All machines":
         filtered = filtered[filtered["machine_id"] == selected_machine]
 
-    st.plotly_chart(
-        px.line(filtered, x="timestamp", y=metric, color="machine_id", title=f"{metric} over time"),
-        use_container_width=True,
-    )
+    st.plotly_chart(_plot_metric_timeseries(filtered, anomalies, metric, selected_machine), use_container_width=True)
     st.dataframe(filtered.tail(200).sort_values("timestamp", ascending=False), use_container_width=True)
 
 
@@ -262,18 +518,32 @@ def render_machine_details(events: pd.DataFrame, anomalies: pd.DataFrame) -> Non
                 f"<span style='color:{color}; font-size:0.9rem'>[{status}]</span>",
                 unsafe_allow_html=True,
             )
-            score_cols = st.columns(4)
-            score_cols[0].metric("Sensor health", f"{row['latest_sensor_health']:.1f}")
-            score_cols[1].metric("Recent anomaly penalty", f"-{int(row['recent_anomaly_penalty'])}")
-            score_cols[2].metric("Final health score", f"{row['final_health_score']:.1f}")
-            score_cols[3].metric("Status", status)
 
+            st.markdown("<div class='section-title'>Global State</div>", unsafe_allow_html=True)
+            global_cols = st.columns(3)
+            _render_card(global_cols[0], "Status", status, color=color)
+            _render_card(global_cols[1], "Final Health Score", f"{row['final_health_score']:.1f}/100")
+            _render_card(global_cols[2], "Risk Level", row["risk_level"])
+
+            st.markdown("<div class='section-title'>Diagnostic</div>", unsafe_allow_html=True)
+            diagnostic_cols = st.columns(3)
+            _render_card(diagnostic_cols[0], "Sensor Health", f"{row['latest_sensor_health']:.1f}/100")
+            _render_card(diagnostic_cols[1], "Anomaly Penalty", f"{int(row['recent_anomaly_penalty'])}")
+            _render_card(diagnostic_cols[2], "Recent Anomalies", f"{int(row['recent_anomaly_count'])}")
+
+            cause_cols = st.columns(3)
+            _render_card(cause_cols[0], "Probable Cause", row["probable_cause"])
+            _render_card(cause_cols[1], "Confidence", f"{int(row['root_cause_confidence'])}%")
+            _render_card(cause_cols[2], "Recommended Action", row["root_cause_action"])
+
+            st.markdown("<div class='section-title'>Sensors</div>", unsafe_allow_html=True)
             signal_cols = st.columns(5)
-            signal_cols[0].metric("Temp", f"{row['temperature']:.1f}")
-            signal_cols[1].metric("Vibration", f"{row['vibration']:.3f}")
-            signal_cols[2].metric("Pressure", f"{row['pressure']:.2f}")
-            signal_cols[3].metric("Power", f"{row['power_consumption']:.0f}")
-            signal_cols[4].metric("Speed", f"{row['motor_speed']:.0f}")
+            _render_sensor_card(signal_cols[0], "Temperature", row, "temperature", "C")
+            _render_sensor_card(signal_cols[1], "Pressure", row, "pressure", "bar")
+            _render_sensor_card(signal_cols[2], "Vibration", row, "vibration", "")
+            _render_sensor_card(signal_cols[3], "Power", row, "power_consumption", "W")
+            _render_sensor_card(signal_cols[4], "Speed", row, "motor_speed", "rpm")
+
             recent = anomalies[anomalies["machine_id"] == row["machine_id"]].head(5) if not anomalies.empty else anomalies
             st.write(f"Recommendation: {recommendation}")
             if not recent.empty:
@@ -296,6 +566,26 @@ def _explain_anomaly(row: pd.Series) -> str:
     return f"{row['machine_id']} shows a {row['anomaly_severity']} anomaly linked to {joined}."
 
 
+def _extract_machine_from_question(question: str) -> str | None:
+    upper_question = question.upper()
+    for machine in MACHINES:
+        if machine in upper_question:
+            return machine
+    return None
+
+
+def _assistant_probable_cause(question: str, anomalies: pd.DataFrame) -> str:
+    if anomalies.empty:
+        return "No anomaly context available"
+    machine_id = _extract_machine_from_question(question)
+    context = anomalies
+    if machine_id:
+        context = anomalies[anomalies["machine_id"] == machine_id]
+    if context.empty:
+        context = anomalies
+    return analyze_root_cause(context.iloc[0]).probable_cause
+
+
 def render_anomalies(anomalies: pd.DataFrame) -> None:
     st.header("Anomalies")
     if anomalies.empty:
@@ -311,6 +601,10 @@ def render_anomalies(anomalies: pd.DataFrame) -> None:
         filtered = filtered[filtered["anomaly_severity"] == severity]
 
     if not filtered.empty:
+        filtered = filtered.copy()
+        root_causes = filtered.apply(analyze_root_cause, axis=1)
+        filtered["probable_cause"] = [item.probable_cause for item in root_causes]
+        filtered["root_cause_confidence"] = [item.confidence for item in root_causes]
         st.info(_explain_anomaly(filtered.iloc[0]))
         st.plotly_chart(
             px.scatter(
@@ -320,6 +614,14 @@ def render_anomalies(anomalies: pd.DataFrame) -> None:
                 color="anomaly_severity",
                 size=filtered["anomaly_score"].abs(),
                 title="Anomaly timeline",
+                hover_data={
+                    "machine_id": True,
+                    "anomaly_severity": True,
+                    "anomaly_score": ":.5f",
+                    "probable_cause": True,
+                    "root_cause_confidence": True,
+                    "timestamp": True,
+                },
             ),
             use_container_width=True,
         )
@@ -340,12 +642,14 @@ def render_ai_assistant() -> None:
     final_question = custom.strip() or question
     if st.button("Ask assistant"):
         response = answer_question(final_question)
-        st.markdown(response["answer"])
-        if "risk_level" in response:
-            st.metric("Risk level", response["risk_level"])
-        if "recommendation" in response:
-            st.success(response["recommendation"])
-        st.caption(f"Sources: {', '.join(response.get('sources', []))}")
+        summary, cause, risk, recommendation = st.columns(4)
+        _render_card(summary, "Summary", response.get("answer", "No answer available"))
+        _render_card(cause, "Probable Cause", _assistant_probable_cause(final_question, get_latest_anomalies(limit=200)))
+        _render_card(risk, "Risk Level", response.get("risk_level", "unknown"))
+        _render_card(recommendation, "Recommendation", response.get("recommendation", "Review latest anomalies."))
+        with st.expander("Data used"):
+            st.json(response.get("data_used", {}))
+            st.caption(f"Sources: {', '.join(response.get('sources', []))}")
 
 
 def render_reports(events: pd.DataFrame, anomalies: pd.DataFrame) -> None:
@@ -427,7 +731,7 @@ def main() -> None:
     if page == "Overview":
         render_overview(events, anomalies, metrics)
     elif page == "Live Monitoring":
-        render_live_monitoring(events)
+        render_live_monitoring(events, anomalies)
     elif page == "Machine Details":
         render_machine_details(events, anomalies)
     elif page == "Anomalies":

@@ -240,7 +240,7 @@ This project demonstrates practical experience with:
 - dashboard development
 - explainable AI concepts
 
-For recruiters, the value of the project is that it connects multiple skills into one coherent product-like prototype. It shows the ability to structure data flows, train and use a model, expose results through an API, create an operator-facing dashboard, document limitations honestly, and keep the system runnable on a local Windows machine.
+the value of the project is that it connects multiple skills into one coherent product-like prototype. It shows the ability to structure data flows, train and use a model, expose results through an API, create an operator-facing dashboard, document limitations honestly, and keep the system runnable on a local Windows machine.
 
 ## Tech Stack
 
@@ -538,11 +538,6 @@ Expected local result:
 - Add authentication and production-grade observability for the API.
 - Add experiment tracking for model versions and threshold calibration.
 
-## CV Pitch
-
-Assistant IA de Surveillance Continue - Projet personnel
-
-Developpement d'un prototype de monitoring temps reel sur donnees capteurs industrielles simulees, integrant Pathway pour le traitement continu, Isolation Forest pour la detection d'anomalies, FastAPI, Streamlit et un agent IA d'aide a l'analyse.
 
 ## GitHub Setup
 
